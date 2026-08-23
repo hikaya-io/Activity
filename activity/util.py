@@ -135,7 +135,7 @@ def group_excluded(*group_names, url):
 def group_required(*group_names, url):
     # Requires user membership in at least one of the groups passed in.
     def in_groups(u):
-        if u.is_authenticated():
+        if u.is_authenticated:
             if bool(u.groups.filter(name__in=group_names)) | u.is_superuser:
                 return True
             raise PermissionDenied
@@ -236,7 +236,13 @@ def send_invite_emails(subject, email_from, email_to, data):
         msg.send()
 
 
-def send_single_mail(subject, email_from, email_to, data, email_txt, email_html):
+import logging
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+
+def send_single_mail(subject, email_from, email_to, data, email_txt, email_html, fail_silently=False):
     """
     Send single email
     :param subject: email subject
@@ -245,27 +251,36 @@ def send_single_mail(subject, email_from, email_to, data, email_txt, email_html)
     :param data: context data
     :param email_txt: text email template
     :param email_html: html email template
+    :param fail_silently: whether to suppress exceptions
     """
     email_context = data
-    email_txt = loader.render_to_string(email_txt, email_context)
-    email_html = loader.get_template(email_html)
-    email_html_content = email_html.render(email_context)
+    email_txt_content = loader.render_to_string(email_txt, email_context)
+    email_html_template = loader.get_template(email_html)
+    email_html_content = email_html_template.render(email_context)
+
+    sender = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or email_from or 'team.hikaya@gmail.com'
+    if '<' not in sender:
+        from_email_header = 'Hikaya <{}>'.format(sender)
+    else:
+        from_email_header = sender
 
     msg = EmailMultiAlternatives(
         subject,
-        email_txt,
-        'Hikaya <{}>'.format(email_from),
+        email_txt_content,
+        from_email_header,
         email_to
     )
     msg.attach_alternative(email_html_content, "text/html")
-    msg.send()
+    return msg.send(fail_silently=fail_silently)
 
 
 def user_signup_notification(user):
     url = os.environ.get('SLACK_REGISTRATION_WEBHOOK')
+    if not url:
+        return
     message = ("A new user has signed up on activity")
     title = ("New User Sign Up :zap:")
-    date = user.date_joined.strftime('%d-%m-%Y')
+    date = user.date_joined.strftime('%d-%m-%Y') if user.date_joined else ''
 
     slack_data = {
         "username": "new-user-notification",
@@ -294,8 +309,11 @@ def user_signup_notification(user):
             },
         ]
     }
-    byte_length = str(sys.getsizeof(slack_data))
-    headers = {'Content-Type': "application/json", 'Content-Length': byte_length}
-    response = requests.post(url, data=json.dumps(slack_data), headers=headers)
-    if response.status_code != 200:
-        raise Exception(response.status_code, response.text)
+    headers = {'Content-Type': "application/json"}
+    try:
+        response = requests.post(url, data=json.dumps(slack_data), headers=headers, timeout=5)
+        if response.status_code != 200:
+            logger.warning("Slack notification returned non-200 status: %s %s", response.status_code, response.text)
+    except Exception as e:
+        logger.warning("Slack registration webhook failed: %s", e)
+
