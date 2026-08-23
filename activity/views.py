@@ -135,6 +135,11 @@ def switch_organization(request, org_id):
     return redirect('/')
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 def activate_acccount(request, uidb64, token):
     try:
         uid = force_text(urlsafe_base64_decode(uidb64))
@@ -146,10 +151,16 @@ def activate_acccount(request, uidb64, token):
         user.save()
 
         # send welcome mail
-        send_welcome_email(request, user)
+        try:
+            send_welcome_email(request, user)
+        except Exception as e:
+            logger.warning("Failed to send welcome email on account activation: %s", e)
 
         # send slack notification
-        user_signup_notification(user)
+        try:
+            user_signup_notification(user)
+        except Exception as e:
+            logger.warning("Failed to send slack notification on account activation: %s", e)
 
         # login(request, user)
         messages.success(
@@ -190,71 +201,83 @@ def register(request, invite_uuid):
     # privacy = ActivitySites.objects.get(id=1)
     if request.method == 'POST':
         data = request.POST
-        first_name = data.get('first_name')
-        last_name = data.get('last_name')
-        username = data.get('username')
+        first_name = data.get('first_name', '').strip()
+        last_name = data.get('last_name', '').strip()
+        username = data.get('username', '').strip()
+        email_raw = data.get('email_address', '').strip()
         # always change the mail address to LowerCase
-        email = data.get('email_address').lower()
+        email = email_raw.lower() if email_raw else ''
         password = data.get('password')
 
+        if not first_name or not username or not email or not password:
+            messages.error(request, 'Please ensure you fill in all required fields')
+            return render(request, 'registration/register.html', set_invite_uuid(invite_uuid))
+
+        if User.objects.filter(email=email).exists():
+            context = set_invite_uuid(invite_uuid)
+            context['message_email'] = 'email already exists !'
+            return render(request, 'registration/register.html', context)
+
         try:
-            if User.objects.get(email=email):
-                invite_uuid = set_invite_uuid(invite_uuid)
-                invite_uuid['message_email'] = 'email already exists !'
-                return render(request, 'registration/register.html', invite_uuid)
+            user = User.objects.create_user(
+                first_name=first_name,
+                last_name=last_name,
+                username=username,
+                email=email,
+                password=password,
+                is_active=False,
+            )
+        except IntegrityError:
+            context = set_invite_uuid(invite_uuid)
+            context['message_username'] = 'username already exists !'
+            return render(request, 'registration/register.html', context)
 
-        except User.DoesNotExist:
-            try:
-                user = User.objects.create_user(
-                    first_name=first_name,
-                    last_name=last_name,
-                    username=username,
-                    email=email,
-                    password=password,
-                    is_active=False,
-                )
-            except IntegrityError:
-                invite_uuid = set_invite_uuid(invite_uuid)
-                invite_uuid['message_username'] = 'username already exists !'
-                return render(request, 'registration/register.html', invite_uuid)
-
-            except ValueError:
-                messages.error(request, 'Please ensure you fill in all required fields')
-                return render(request, 'registration/register.html')
+        except ValueError:
+            messages.error(request, 'Please ensure you fill in all required fields')
+            return render(request, 'registration/register.html', set_invite_uuid(invite_uuid))
 
         if user:
             if user_invite is not None:
                 # activate invited user accounts
                 user.is_active = True
                 user.save()
-                activity_user = ActivityUser.objects.create(
+                activity_user, _ = ActivityUser.objects.get_or_create(
                     user=user,
-                    organization_id=user_invite.organization.id,
-                    name='{} {}'.format(user.first_name, user.last_name)
+                    defaults={
+                        'organization_id': user_invite.organization.id,
+                        'name': '{} {}'.format(user.first_name, user.last_name)
+                    }
                 )
+                if not activity_user.organization_id:
+                    activity_user.organization = user_invite.organization
+                    activity_user.save()
 
                 # add organization to user organizations
                 activity_user.organizations.add(user_invite.organization)
 
                 # define user organization access groups
-                user_org_access = ActivityUserOrganizationGroup.objects.create(
+                group, _ = Group.objects.get_or_create(name='Editor')
+                user_org_access, _ = ActivityUserOrganizationGroup.objects.get_or_create(
                     activity_user=activity_user,
                     organization=user_invite.organization,
+                    defaults={'group': group}
                 )
-                # set default permission to editor on invite
-                group = Group.objects.get(name='Editor')
-                user_org_access.group = group
-                user_org_access.save()
-                if activity_user:
-                    # delete the invitation
-                    user_invite.delete()
+                if user_org_access.group != group:
+                    user_org_access.group = group
+                    user_org_access.save()
 
-                    # send welcome email
+                # delete the invitation
+                user_invite.delete()
+
+                # send welcome email
+                try:
                     send_welcome_email(request, user)
+                except Exception as e:
+                    logger.warning("Failed to send welcome email: %s", e)
 
-                    messages.success(
-                        request, 'Thanks, your email address has been confirmed')
-                    return render(request, 'registration/login.html', {'invite_uuid': 'none'})
+                messages.success(
+                    request, 'Thanks, your email address has been confirmed')
+                return render(request, 'registration/login.html', {'invite_uuid': 'none'})
 
             else:
                 mail_subject = 'Please confirm your email address'
@@ -266,40 +289,40 @@ def register(request, invite_uuid):
                 }
                 email_txt = 'emails/registration/email_confirmation.txt'
                 email_html = 'emails/registration/email_confirmation.html'
+                email_from = getattr(settings, 'DEFAULT_FROM_EMAIL', 'team.hikaya@gmail.com') or 'team.hikaya@gmail.com'
 
                 try:
                     send_single_mail(
                         mail_subject,
-                        'team.hikaya@gmail.com',
+                        email_from,
                         [email],
                         data,
                         email_txt,
                         email_html
                     )
-                except SMTPRecipientsRefused:
+                except Exception as e:
+                    logger.warning("Failed to send confirmation email: %s", e)
                     # delete user if an email can't be sent
                     user.delete()
                     messages.error(
                         request,
-                        'We can not confirmation mail, please check email address and try again',
+                        'We cannot send confirmation email, please check email address and try again',
                         fail_silently=True
                     )
-                    return render(request, 'registration/register.html')
+                    return render(request, 'registration/register.html', set_invite_uuid(invite_uuid))
 
-            activity_user = ActivityUser.objects.create(
+            activity_user, _ = ActivityUser.objects.get_or_create(
                 user=user,
-                name='{} {}'.format(user.first_name, user.last_name)
+                defaults={'name': '{} {}'.format(user.first_name, user.last_name)}
             )
             if activity_user:
                 return render(request, 'registration/confirm_email.html')
 
             else:
-                return render(request, 'registration/register.html')
+                return render(request, 'registration/register.html', set_invite_uuid(invite_uuid))
 
     else:
-
         invite_uuid = set_invite_uuid(invite_uuid)
-
         return render(request, 'registration/register.html', invite_uuid)
 
 
@@ -308,10 +331,11 @@ def send_welcome_email(request, user):
     data = {'user': user, 'domain': request.build_absolute_uri('/').strip('/')}
     email_txt = 'emails/registration/welcome.txt'
     email_html = 'emails/registration/welcome.html'
+    email_from = getattr(settings, 'DEFAULT_FROM_EMAIL', 'team.hikaya@gmail.com') or 'team.hikaya@gmail.com'
 
     send_single_mail(
         mail_subject,
-        'team.hikaya@gmail.com',
+        email_from,
         [user.email],
         data,
         email_txt,
@@ -346,7 +370,7 @@ class UserLogin(View):
         username = data.get('username', None)
         password = data.get('password', None)
         # check if user is active
-        user = User.objects.filter(Q(username__iexact=username) | Q(email__iexact=username.lower())).first()
+        user = User.objects.filter(Q(username__iexact=username) | Q(email__iexact=username.lower() if username else '')).first()
         if not user:
             messages.error(request, 'Incorrect credentials.', fail_silently=True)
             return render(request, 'registration/login.html')
@@ -362,8 +386,11 @@ class UserLogin(View):
             return render(request, 'registration/login.html')
 
         login(request, user)
-        activity_user = ActivityUser.objects.filter(user=user).first()
-        if activity_user.organization:
+        activity_user, _ = ActivityUser.objects.get_or_create(
+            user=user,
+            defaults={'name': '{} {}'.format(user.first_name, user.last_name)}
+        )
+        if activity_user and activity_user.organization:
             return HttpResponseRedirect('/')
 
         return HttpResponseRedirect('/accounts/register/organization')
@@ -391,20 +418,25 @@ class RegisterOrganization(LoginRequiredMixin, View):
             activity_url=activity_url
         )
         if org:
-            user = ActivityUser.objects.get(user=request.user)
+            user, _ = ActivityUser.objects.get_or_create(
+                user=request.user,
+                defaults={'name': '{} {}'.format(request.user.first_name, request.user.last_name)}
+            )
             # add organization to the current user
             user.organization = org
             user.save()
             user.organizations.add(org)
 
             # define user organization access groups
-            user_org_access = ActivityUserOrganizationGroup.objects.create(
+            group, _ = Group.objects.get_or_create(name='Owner')
+            user_org_access, _ = ActivityUserOrganizationGroup.objects.get_or_create(
                 activity_user=user,
                 organization=org,
+                defaults={'group': group}
             )
-            group = Group.objects.get(name='Owner')
-            user_org_access.group = group
-            user_org_access.save()
+            if user_org_access.group != group:
+                user_org_access.group = group
+                user_org_access.save()
 
             return redirect('/')
         else:
